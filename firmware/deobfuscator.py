@@ -1,29 +1,65 @@
 #!/usr/bin/env python3
 """
-M3 — Deobfuscation Tool: XOR decoding, base64 unpacking, string extraction
+M3 — Deobfuscator
 
-Educational tool for malware deobfuscation and encoded payload analysis.
+Real, pure-stdlib deobfuscation passes for educational malware analysis:
+
+  * string XOR lifting            single- and repeating-key XOR recovery to
+                                  printable ASCII (confidence-ranked)
+  * base64 / base32 / base16      decode of encoded blobs found in the sample
+  * hex lifting                   decode of hex-encoded byte strings
+  * eval / constant folding       AST pass that folds constant expressions and
+                                  eval("...") calls back to their literal value
+  * bytecode disassembly          dismodule disassembly of embedded Python
+  * suspicious pattern scan       shellcode / anti-debug / persistence / exfil
+                                  signature matches + entropy analysis
+
+Offline, deterministic, stdlib-only (no python-magic / yara / lief).
+
+Usage:
+    python3 deobfuscator.py <file> [-o reports/out.json] [--markdown]
+
+WARNING: Educational / authorized analysis only.
 """
 
-import os
-import sys
-import re
-import json
-import base64
-import string
-import hashlib
 import argparse
+import ast
+import base64
 import binascii
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, asdict
+import hashlib
+import json
+import logging
+import math
+import operator
+import os
+import re
+import sys
 from collections import Counter
+from dataclasses import asdict, dataclass, field
 
-try:
-    import magic
-    MAGIC_AVAILABLE = True
-except ImportError:
-    MAGIC_AVAILABLE = False
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("m3")
+
+# ---------------------------------------------------------------------------
+# entropy / strings
+# ---------------------------------------------------------------------------
+
+
+def entropy(data):
+    if not data:
+        return 0.0
+    c = Counter(data)
+    n = len(data)
+    return -sum((p / n) * math.log2(p / n) for p in c.values())
+
+
+@dataclass
+class ExtractedString:
+    offset: int
+    value: str
+    encoding: str
+    category: str
+    length: int
 
 
 @dataclass
@@ -38,12 +74,11 @@ class DecodedPayload:
 
 
 @dataclass
-class ExtractedString:
-    offset: int
-    value: str
-    encoding: str
-    category: str
-    length: int
+class FoldResult:
+    kind: str            # const | eval
+    expression: str
+    result: str
+    line: int
 
 
 @dataclass
@@ -54,478 +89,444 @@ class AnalysisResult:
     md5: str
     sha256: str
     total_entropy: float
-    extracted_strings: List[ExtractedString]
-    decoded_payloads: List[DecodedPayload]
-    suspicious_patterns: List[Dict]
-    recommendations: List[str]
+    extracted_strings: list = field(default_factory=list)
+    decoded_payloads: list = field(default_factory=list)
+    susp_patterns: list = field(default_factory=list)
+    folds: list = field(default_factory=list)          # constant folding
+    disassembly: str = ""
+    recommendations: list = field(default_factory=list)
 
 
-class EntropyAnalyzer:
-    @staticmethod
-    def calculate(data: bytes) -> float:
-        if not data:
-            return 0.0
-        counter = Counter(data)
-        length = len(data)
-        entropy = 0.0
-        for count in counter.values():
-            p = count / length
-            if p > 0:
-                entropy -= p * (p and __import__('math').log2(p))
-        return entropy
+# ---------------------------------------------------------------------------
+# string extraction / categorization
+# ---------------------------------------------------------------------------
 
-    @staticmethod
-    def classify(entropy: float) -> str:
-        if entropy < 1.0:
-            return "very low (likely structured data)"
-        elif entropy < 3.0:
-            return "low (likely text/code)"
-        elif entropy < 5.0:
-            return "medium (mixed content)"
-        elif entropy < 7.0:
-            return "high (likely compressed/encrypted)"
+CATEGORIES = {
+    "url": re.compile(r"https?://[^\s\x00-\x1f]{4,}"),
+    "ip": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    "registry": re.compile(r"HK(?:LM|CU|CR|U|CC)\\[^\s\x00-\x1f]{4,}"),
+    "api_call": re.compile(
+        r"\b(?:Create|Open|Read|Write|Load|Get|Set|Send|Recv|Virtual|Alloc|"
+        r"Internet|URL|Http|Socket|Process|Thread|File|Reg|Crypt)[A-Za-z]*\b"),
+}
+
+def _most_frequent(values):
+    from collections import Counter as _C
+    return _C(values).most_common(1)[0][0]
+
+
+PRINTABLE = set(range(32, 127))
+
+
+def extract_strings(data, min_len=6, max_strings=2000):
+    out = []
+    run = []
+    start = 0
+    for i, b in enumerate(data):
+        if b in PRINTABLE:
+            if not run:
+                start = i
+            run.append(chr(b))
         else:
-            return "very high (likely random/encrypted)"
+            if len(run) >= min_len:
+                s = "".join(run)
+                cat = next((c for c, p in CATEGORIES.items() if p.search(s)),
+                           "generic")
+                out.append(ExtractedString(start, s, "ascii", cat, len(s)))
+            run = []
+    if len(run) >= min_len:
+        s = "".join(run)
+        cat = next((c for c, p in CATEGORIES.items() if p.search(s)), "generic")
+        out.append(ExtractedString(start, s, "ascii", cat, len(s)))
+    out.sort(key=lambda x: x.length, reverse=True)
+    return out[:max_strings]
 
 
-class StringExtractor:
-    MIN_LENGTH = 4
-    PRINTABLE = set(string.printable)
-
-    CATEGORIES = {
-        'url': re.compile(r'https?://[^\s\x00-\x1f]{4,}'),
-        'ip': re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),
-        'email': re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),
-        'file_path': re.compile(r'[A-Z]:\\[^\s\x00-\x1f]{4,}|/(?:usr|etc|var|tmp|home)/[^\s\x00-\x1f]{4,}'),
-        'registry': re.compile(r'HK(?:LM|CU|CR|U|CC)\\[^\s\x00-\x1f]{4,}'),
-        'api_call': re.compile(r'\b(?:Create|Open|Read|Write|Close|Load|Get|Set|Send|Recv|Connect|Bind|Listen|Accept|Virtual|Alloc|Free|Protect|Copy|Move|Delete|Reg|Internet|URL|Http|Socket|Process|Thread|File|Pipe|Mutex|Event|Service|Crypt|Hash|Encrypt|Decrypt)[A-Za-z]*\b'),
-        'powershell': re.compile(r'(?:powershell|cmd\.exe|wscript|cscript|mshta|rundll32|regsvr32|certutil|bitsadmin)\s+[^\s\x00-\x1f]{2,}', re.IGNORECASE),
-        'base64_chunk': re.compile(r'[A-Za-z0-9+/]{40,}={0,2}'),
-    }
-
-    def extract(self, data: bytes, max_strings: int = 5000) -> List[ExtractedString]:
-        strings = []
-        current = []
-        offset = 0
-
-        for i, byte in enumerate(data):
-            if 32 <= byte <= 126:
-                current.append(chr(byte))
-            else:
-                if len(current) >= self.MIN_LENGTH:
-                    s = ''.join(current)
-                    category = self._categorize(s)
-                    encoding = self._detect_encoding(s)
-                    strings.append(ExtractedString(
-                        offset=offset, value=s, encoding=encoding,
-                        category=category, length=len(s)
-                    ))
-                current = []
-                offset = i + 1
-
-        if len(current) >= self.MIN_LENGTH:
-            s = ''.join(current)
-            strings.append(ExtractedString(
-                offset=offset, value=s,
-                encoding=self._detect_encoding(s),
-                category=self._categorize(s), length=len(s)
-            ))
-
-        strings.sort(key=lambda x: x.length, reverse=True)
-        return strings[:max_strings]
-
-    def _categorize(self, s: str) -> str:
-        for cat, pattern in self.CATEGORIES.items():
-            if pattern.search(s):
-                return cat
-        return 'generic'
-
-    def _detect_encoding(self, s: str) -> str:
-        if re.match(r'^[01]+$', s) and len(s) % 8 == 0:
-            return 'binary'
-        if re.match(r'^[0-9a-fA-F]+$', s) and len(s) >= 8 and len(s) % 2 == 0:
-            return 'hex'
-        if re.match(r'^[A-Za-z0-9+/]+={0,2}$', s) and len(s) >= 16:
-            try:
-                decoded = base64.b64decode(s)
-                printable_ratio = sum(1 for b in decoded if 32 <= b <= 126) / max(len(decoded), 1)
-                if printable_ratio > 0.5:
-                    return 'base64'
-            except Exception:
-                pass
-        return 'ascii'
+# ---------------------------------------------------------------------------
+# XOR lifting
+# ---------------------------------------------------------------------------
 
 
 class XORDecoder:
-    def decode_single_byte(self, data: bytes) -> List[DecodedPayload]:
+    def single_byte(self, data):
         results = []
-        entropy_before = EntropyAnalyzer.calculate(data)
-
+        eb = entropy(data)
         for key in range(256):
-            decoded = bytes([b ^ key for b in data])
-            entropy_after = EntropyAnalyzer.calculate(decoded)
-            printable_ratio = sum(1 for b in decoded if 32 <= b <= 126) / max(len(decoded), 1)
-
-            if printable_ratio > 0.6 and entropy_after < entropy_before:
-                confidence = printable_ratio * (1 - entropy_after / 8.0)
-                try:
-                    text = decoded.decode('ascii', errors='ignore')
-                except Exception:
-                    text = repr(decoded)
+            dec = bytes(b ^ key for b in data)
+            ea = entropy(dec)
+            printable = sum(1 for b in dec if b in PRINTABLE) / max(len(dec), 1)
+            if printable > 0.55:
+                conf = min(printable * max(1 - ea / 8.0, 0.3), 1.0)
                 results.append(DecodedPayload(
-                    method=f'XOR single-byte (key=0x{key:02x})',
-                    input_preview=binascii.hexlify(data[:50]).decode(),
-                    output_preview=text[:200],
-                    output_hex=binascii.hexlify(decoded[:100]).decode(),
-                    confidence=min(confidence, 1.0),
-                    entropy_before=entropy_before,
-                    entropy_after=entropy_after
-                ))
-
+                    method="XOR single-byte (key=0x%02x)" % key,
+                    input_preview=binascii.hexlify(data[:48]).decode(),
+                    output_preview=dec.decode("latin1")[:200],
+                    output_hex=binascii.hexlify(dec[:96]).decode(),
+                    confidence=round(conf, 4),
+                    entropy_before=round(eb, 4), entropy_after=round(ea, 4)))
         results.sort(key=lambda x: x.confidence, reverse=True)
         return results[:10]
 
-    def decode_repeating_key(self, data: bytes, max_key_len: int = 16) -> List[DecodedPayload]:
+    def repeating_key(self, data, max_len=16):
         results = []
-        entropy_before = EntropyAnalyzer.calculate(data)
-
-        for key_len in range(2, min(max_key_len + 1, len(data) // 4)):
-            for start_pos in range(min(key_len, len(data))):
-                key_fragment = data[start_pos::key_len][:key_len]
-                key = bytes([key_fragment[i % len(key_fragment)] for i in range(key_len)])
-                decoded = bytes([data[i] ^ key[i % key_len] for i in range(len(data))])
-
-                printable_ratio = sum(1 for b in decoded if 32 <= b <= 126) / max(len(decoded), 1)
-                entropy_after = EntropyAnalyzer.calculate(decoded)
-
-                if printable_ratio > 0.65 and entropy_after < 5.0:
-                    confidence = printable_ratio * (1 - entropy_after / 8.0)
-                    try:
-                        text = decoded.decode('ascii', errors='ignore')
-                    except Exception:
-                        text = repr(decoded)
-                    results.append(DecodedPayload(
-                        method=f'XOR repeating-key (len={key_len}, key={binascii.hexlify(key).decode()})',
-                        input_preview=binascii.hexlify(data[:50]).decode(),
-                        output_preview=text[:200],
-                        output_hex=binascii.hexlify(decoded[:100]).decode(),
-                        confidence=min(confidence, 1.0),
-                        entropy_before=entropy_before,
-                        entropy_after=entropy_after
-                    ))
-
-        results.sort(key=lambda x: x.confidence, reverse=True)
-        return results[:10]
-
-
-class Base64Decoder:
-    def decode_all(self, data: bytes) -> List[DecodedPayload]:
-        results = []
-        entropy_before = EntropyAnalyzer.calculate(data)
-
-        patterns = [
-            re.compile(rb'[A-Za-z0-9+/]{40,}={0,2}'),
-            re.compile(rb'[A-Za-z0-9+/]{20,}={1,2}'),
-        ]
-
-        seen = set()
-        for pattern in patterns:
-            for match in pattern.finditer(data):
-                encoded = match.group().decode('ascii')
-                if encoded in seen:
-                    continue
-                seen.add(encoded)
-
-                for encoding in [base64.b64decode, base64.b32decode, base64.b16decode]:
-                    try:
-                        decoded = encoding(encoded)
-                        if len(decoded) < 4:
-                            continue
-                        entropy_after = EntropyAnalyzer.calculate(decoded)
-                        printable_ratio = sum(
-                            1 for b in decoded if 32 <= b <= 126
-                        ) / max(len(decoded), 1)
-
-                        if printable_ratio > 0.5:
-                            confidence = printable_ratio * 0.8
-                            try:
-                                text = decoded.decode('utf-8', errors='ignore')
-                            except Exception:
-                                text = repr(decoded)
-                            method_name = {
-                                base64.b64decode: 'Base64',
-                                base64.b32decode: 'Base32',
-                                base64.b16decode: 'Base16/Hex'
-                            }[encoding]
-                            results.append(DecodedPayload(
-                                method=f'{method_name} decode',
-                                input_preview=encoded[:100],
-                                output_preview=text[:200],
-                                output_hex=binascii.hexlify(decoded[:100]).decode(),
-                                confidence=min(confidence, 1.0),
-                                entropy_before=entropy_before,
-                                entropy_after=entropy_after
-                            ))
-                            break
-                    except Exception:
-                        continue
-
-        results.sort(key=lambda x: x.confidence, reverse=True)
-        return results[:20]
-
-
-class HexDecoder:
-    def decode(self, data: bytes) -> List[DecodedPayload]:
-        results = []
-        entropy_before = EntropyAnalyzer.calculate(data)
-
-        text = data.decode('ascii', errors='ignore')
-        hex_pattern = re.compile(r'(?:0x)?([0-9a-fA-F]{2}(?:\s*[0-9a-fA-F]{2}){3,})')
-        for match in hex_pattern.finditer(text):
-            hex_str = match.group(1).replace(' ', '')
-            try:
-                decoded = bytes.fromhex(hex_str)
-                if len(decoded) < 2:
-                    continue
-                entropy_after = EntropyAnalyzer.calculate(decoded)
-                printable_ratio = sum(
-                    1 for b in decoded if 32 <= b <= 126
-                ) / max(len(decoded), 1)
-
-                if printable_ratio > 0.5:
-                    confidence = printable_ratio * 0.7
-                    try:
-                        dec_text = decoded.decode('utf-8', errors='ignore')
-                    except Exception:
-                        dec_text = repr(decoded)
-                    results.append(DecodedPayload(
-                        method='Hex decode',
-                        input_preview=hex_str[:100],
-                        output_preview=dec_text[:200],
-                        output_hex=binascii.hexlify(decoded[:100]).decode(),
-                        confidence=min(confidence, 1.0),
-                        entropy_before=entropy_before,
-                        entropy_after=entropy_after
-                    ))
-            except ValueError:
+        eb = entropy(data)
+        for klen in range(2, min(max_len, len(data))):
+            blocks = [data[i:i + klen] for i in range(0, len(data), klen)]
+            full = [b for b in blocks if len(b) == klen]
+            if not full:
                 continue
+            zipped = list(zip(*full))
+            # Standard IC-based recovery: the most frequent byte in each key
+            # column is very likely the plaintext space (0x20).
+            key = bytes(0x20 ^ _most_frequent(col) for col in zipped)
+            dec = bytes(data[i] ^ key[i % klen] for i in range(len(data)))
+            printable = sum(1 for b in dec if b in PRINTABLE) / max(len(dec), 1)
+            ea = entropy(dec)
+            if printable > 0.55:
+                conf = min(printable * max(1 - ea / 8.0, 0.3), 1.0)
+                results.append(DecodedPayload(
+                    method="XOR repeating (len=%d key=%s)"
+                           % (klen, binascii.hexlify(key).decode()),
+                    input_preview=binascii.hexlify(data[:48]).decode(),
+                    output_preview=dec.decode("latin1")[:200],
+                    output_hex=binascii.hexlify(dec[:96]).decode(),
+                    confidence=round(conf, 4),
+                    entropy_before=round(eb, 4), entropy_after=round(ea, 4)))
+        results.sort(key=lambda x: x.confidence, reverse=True)
+        return results[:5]
 
-        return results[:10]
+
+# ---------------------------------------------------------------------------
+# base64 / hex lifting
+# ---------------------------------------------------------------------------
 
 
-class SuspiciousPatternDetector:
-    PATTERNS = {
-        'shellcode_nops': re.compile(rb'\x90{16,}', re.DOTALL),
-        'api_hashing': re.compile(rb'(?:GetModuleHandle|GetProcAddress|LoadLibrary)[A-Z][a-z]+'),
-        'anti_debug': re.compile(rb'(?:IsDebuggerPresent|CheckRemoteDebugger|NtQueryInformation|OutputDebugString)', re.IGNORECASE),
-        'persistence': re.compile(rb'(?:CurrentVersion\\Run|schtasks|HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion)', re.IGNORECASE),
-        'evasion': re.compile(rb'(?:NtSetInformationThread|SetThreadContext|VirtualProtect|PAGE_EXECUTE)', re.IGNORECASE),
-        'data_exfil': re.compile(rb'(?:InternetOpen|HttpSendRequest|URLDownload|WSAStartup|socket|connect)', re.IGNORECASE),
-        'crypto_imports': re.compile(rb'(?:CryptEncrypt|CryptDecrypt|CryptAcquireContext|BCryptEncrypt|AES|RSA)', re.IGNORECASE),
-    }
+def decode_all_encodings(data):
+    results = []
+    eb = entropy(data)
+    seen = set()
+    for m in re.finditer(rb"[A-Za-z0-9+/]{16,}={0,2}", data):
+        enc = m.group().decode("ascii")
+        if enc in seen:
+            continue
+        seen.add(enc)
+        for encname, fn in (("Base64", base64.b64decode),
+                            ("Base32", base64.b32decode),
+                            ("Base16", base64.b16decode)):
+            try:
+                dec = fn(enc)
+            except Exception:
+                continue
+            if len(dec) < 4:
+                continue
+            printable = sum(1 for b in dec if b in PRINTABLE) / max(len(dec), 1)
+            if printable > 0.5:
+                text = dec.decode("latin1")
+                results.append(DecodedPayload(
+                    method="%s decode" % encname,
+                    input_preview=enc[:80],
+                    output_preview=text[:200],
+                    output_hex=binascii.hexlify(dec[:96]).decode(),
+                    confidence=round(printable * 0.8, 4),
+                    entropy_before=round(eb, 4),
+                    entropy_after=round(entropy(dec), 4)))
+                break
+    results.sort(key=lambda x: x.confidence, reverse=True)
+    return results[:15]
 
-    def scan(self, data: bytes) -> List[Dict]:
-        findings = []
-        for name, pattern in self.PATTERNS.items():
-            matches = pattern.findall(data)
-            if matches:
-                findings.append({
-                    'pattern': name,
-                    'count': len(matches),
-                    'samples': [m.decode('ascii', errors='replace')[:100] for m in matches[:5]]
-                })
-        return findings
+
+def decode_hex_strings(data):
+    results = []
+    text = data.decode("latin1")
+    for m in re.finditer(r"(?:0x)?([0-9a-fA-F]{2}(?:\s?[0-9a-fA-F]{2}){3,})",
+                         text):
+        h = m.group(1).replace(" ", "").replace("0x", "")
+        try:
+            dec = bytes.fromhex(h)
+        except ValueError:
+            continue
+        if len(dec) < 3:
+            continue
+        printable = sum(1 for b in dec if b in PRINTABLE) / max(len(dec), 1)
+        if printable > 0.5:
+            results.append(DecodedPayload(
+                method="Hex decode",
+                input_preview=m.group(0)[:80],
+                output_preview=dec.decode("latin1")[:200],
+                output_hex=binascii.hexlify(dec[:96]).decode(),
+                confidence=round(printable * 0.7, 4),
+                entropy_before=round(entropy(data), 4),
+                entropy_after=round(entropy(dec), 4)))
+    return results[:10]
+
+
+# ---------------------------------------------------------------------------
+# eval / constant folding (AST pass)
+# ---------------------------------------------------------------------------
+
+FOLD_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod, ast.Pow: operator.pow,
+    ast.LShift: operator.lshift, ast.RShift: operator.rshift,
+    ast.BitAnd: operator.and_, ast.BitOr: operator.or_, ast.BitXor: operator.xor,
+}
+
+_SAFE_TYPES = (int, float, str, bytes)
+
+
+class _Folder(ast.NodeTransformer):
+    """Fold constant BinOp subtrees and eval('const') calls; record folds."""
+
+    def __init__(self):
+        self.folds = []
+
+    def visit_BinOp(self, node):
+        node = self.generic_visit(node)
+        op = FOLD_OPS.get(type(node.op))
+        if (op is not None
+                and isinstance(node.left, ast.Constant)
+                and isinstance(node.right, ast.Constant)
+                and isinstance(node.left.value, _SAFE_TYPES)
+                and isinstance(node.right.value, _SAFE_TYPES)):
+            if isinstance(node.left.value, bytes) or isinstance(node.right.value, bytes):
+                return node
+            try:
+                val = op(node.left.value, node.right.value)
+            except Exception:
+                return node
+            if isinstance(val, _SAFE_TYPES):
+                self.folds.append(FoldResult(
+                    kind="const",
+                    expression="%r %s %r" % (
+                        node.left.value,
+                        type(node.op).__name__[3:].upper(),
+                        node.right.value),
+                    result=repr(val), line=node.lineno))
+                return ast.copy_location(
+                    ast.Constant(value=val, kind=None), node)
+        return node
+
+    def visit_Call(self, node):
+        node = self.generic_visit(node)
+        if (isinstance(node.func, ast.Name) and node.func.id == "eval"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)):
+            self.folds.append(FoldResult(
+                kind="eval",
+                expression="eval(%r)" % node.args[0].value,
+                result=repr(node.args[0].value), line=node.lineno))
+            return ast.copy_location(
+                ast.Constant(value=node.args[0].value, kind=None), node)
+        return node
+
+
+def fold_constants(source):
+    """Fold constant expressions + eval('...') in Python source via the std
+    ast module. Returns (folded_source, [FoldResult], error_str_or_empty)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return source, [], str(e)
+    folder = _Folder()
+    new_tree = folder.visit(tree)
+    try:
+        folded_src = ast.unparse(new_tree)
+    except Exception:
+        folded_src = source
+    return folded_src, sorted(folder.folds, key=lambda f: (f.line, f.kind)), ""
+
+
+def disassemble_python(source_or_pyc, limit=120):
+    """Real disassembly of a Python source/pyc using the built-in dis module."""
+    import dis
+    import marshal
+    import types
+    if isinstance(source_or_pyc, bytes):
+        code = marshal.loads(source_or_pyc[16:])
+    else:
+        code = compile(source_or_pyc, "<obfuscated>", "exec")
+    out = []
+    out.append("module code object disassembly")
+    for line in dis.Bytecode(code).dis().splitlines()[:limit]:
+        out.append("  " + line)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            out.append("\n# function %r" % (const.co_name or "<lambda>"))
+            for line in dis.Bytecode(const).dis().splitlines()[:limit]:
+                out.append("  " + line)
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# suspicious pattern scan
+# ---------------------------------------------------------------------------
+
+SUSPECT = {
+    "nop_sled": re.compile(rb"\x90{16,}"),
+    "anti_debug": re.compile(
+        rb"(?:IsDebuggerPresent|CheckRemoteDebugger|ptrace|PTRACE_TRACEME)",
+        re.IGNORECASE),
+    "persistence": re.compile(
+        rb"(?:CurrentVersion\\Run|schtasks|/etc/cron|HKLM\\SOFTWARE)",
+        re.IGNORECASE),
+    "exfil/network": re.compile(
+        rb"(?:InternetOpen|HttpSendRequest|URLDownload|WSAStartup|socket\()",
+        re.IGNORECASE),
+    "bad_eval": re.compile(rb"\beval\s*\("),
+    "exec_string": re.compile(rb"(?:exec|system|popen|subprocess)\s*\("),
+}
+
+
+def scan_suspicious(data):
+    hits = []
+    for name, pat in SUSPECT.items():
+        ms = pat.findall(data)
+        if ms:
+            hits.append({"pattern": name, "count": len(ms),
+                         "samples": [m.decode("ascii", "replace")[:80]
+                                     for m in ms[:5]]})
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# orchestrator
+# ---------------------------------------------------------------------------
+
+
+def detect_file_type(data):
+    if data[:2] == b"MZ":
+        return "PE executable"
+    if data[:4] == b"\x7fELF":
+        return "ELF executable"
+    if data[:4] == b"%PDF":
+        return "PDF document"
+    if data[:2] == b"PK":
+        return "ZIP archive"
+    return "Unknown"
 
 
 class Deobfuscator:
-    def __init__(self, args):
-        self.input_path = args.input
-        self.output_dir = args.output or os.path.join(os.path.dirname(self.input_path) or '.', 'deob_output')
-        self.max_strings = args.max_strings
-        self.xor_enabled = args.xor
-        self.base64_enabled = args.base64
-        self.hex_enabled = args.hex
+    def __init__(self, path, do_xor=True, do_b64=True, do_hex=True,
+                 do_fold=True, do_dis=True, max_strings=2000):
+        self.path = path
+        self.flags = (do_xor, do_b64, do_hex, do_fold, do_dis)
+        self.max_strings = max_strings
 
-        os.makedirs(self.output_dir, exist_ok=True)
-
-        self.string_extractor = StringExtractor()
-        self.xor_decoder = XORDecoder()
-        self.base64_decoder = Base64Decoder()
-        self.hex_decoder = HexDecoder()
-        self.pattern_detector = SuspiciousPatternDetector()
-        self.entropy_analyzer = EntropyAnalyzer()
-
-    def _compute_hashes(self, data: bytes) -> Dict[str, str]:
-        return {
-            'md5': hashlib.md5(data).hexdigest(),
-            'sha256': hashlib.sha256(data).hexdigest()
-        }
-
-    def _detect_file_type(self, data: bytes) -> str:
-        if MAGIC_AVAILABLE:
-            try:
-                return magic.from_buffer(data)
-            except Exception:
-                pass
-        if data[:2] == b'MZ':
-            return 'PE executable'
-        if data[:4] == b'\x7fELF':
-            return 'ELF executable'
-        if data[:4] == b'%PDF':
-            return 'PDF document'
-        if data[:3] == b'PK\x03\x04'[:3]:
-            return 'ZIP archive'
-        return 'Unknown'
-
-    def run(self) -> AnalysisResult:
-        logger.info(f"Analyzing: {self.input_path}")
-
-        with open(self.input_path, 'rb') as f:
+    def run(self):
+        with open(self.path, "rb") as f:
             data = f.read()
+        hashes = {"md5": hashlib.md5(data).hexdigest(),
+                  "sha256": hashlib.sha256(data).hexdigest()}
+        res = AnalysisResult(
+            file_path=self.path, file_size=len(data),
+            file_type=detect_file_type(data),
+            md5=hashes["md5"], sha256=hashes["sha256"],
+            total_entropy=round(entropy(data), 4))
+        res.extracted_strings = [asdict(s) for s in
+                                 extract_strings(data, max_strings=self.max_strings)]
 
-        hashes = self._compute_hashes(data)
-        entropy = self.entropy_analyzer.calculate(data)
-        file_type = self._detect_file_type(data)
+        do_xor, do_b64, do_hex, do_fold, do_dis = self.flags
+        xd = XORDecoder()
+        if do_xor:
+            res.decoded_payloads += xd.single_byte(data)
+            res.decoded_payloads += xd.repeating_key(data)
+        if do_b64:
+            res.decoded_payloads += decode_all_encodings(data)
+        if do_hex:
+            res.decoded_payloads += decode_hex_strings(data)
+        dc = [asdict(p) for p in res.decoded_payloads]
+        dc.sort(key=lambda x: x["confidence"], reverse=True)
+        res.decoded_payloads = dc[:40]
 
-        logger.info(f"File type: {file_type}")
-        logger.info(f"Entropy: {entropy:.2f} ({self.entropy_analyzer.classify(entropy)})")
-        logger.info(f"SHA256: {hashes['sha256']}")
+        res.susp_patterns = scan_suspicious(data)
 
-        strings = self.string_extractor.extract(data, self.max_strings)
-        logger.info(f"Extracted {len(strings)} strings")
-
-        decoded_payloads = []
-        if self.xor_enabled:
-            xor_results = self.xor_decoder.decode_single_byte(data)
-            xor_results.extend(self.xor_decoder.decode_repeating_key(data))
-            decoded_payloads.extend(xor_results)
-            logger.info(f"XOR: Found {len(xor_results)} potential decodings")
-
-        if self.base64_enabled:
-            b64_results = self.base64_decoder.decode_all(data)
-            decoded_payloads.extend(b64_results)
-            logger.info(f"Base64: Found {len(b64_results)} potential decodings")
-
-        if self.hex_enabled:
-            hex_results = self.hex_decoder.decode(data)
-            decoded_payloads.extend(hex_results)
-            logger.info(f"Hex: Found {len(hex_results)} potential decodings")
-
-        suspicious = self.pattern_detector.scan(data)
-        logger.info(f"Suspicious patterns: {len(suspicious)}")
-
-        recommendations = self._generate_recommendations(
-            entropy, strings, decoded_payloads, suspicious
-        )
-
-        result = AnalysisResult(
-            file_path=self.input_path,
-            file_size=len(data),
-            file_type=file_type,
-            md5=hashes['md5'],
-            sha256=hashes['sha256'],
-            total_entropy=entropy,
-            extracted_strings=[asdict(s) for s in strings[:200]],
-            decoded_payloads=[asdict(p) for p in decoded_payloads[:50]],
-            suspicious_patterns=suspicious,
-            recommendations=recommendations
-        )
-
-        report_path = os.path.join(self.output_dir, 'deobfuscation_report.json')
-        with open(report_path, 'w') as f:
-            json.dump(asdict(result), f, indent=2, default=str)
-        logger.info(f"Report saved to: {report_path}")
-
-        strings_path = os.path.join(self.output_dir, 'extracted_strings.txt')
-        with open(strings_path, 'w') as f:
-            for s in strings:
-                f.write(f"[{s.offset:08x}] [{s.category}] {s.value}\n")
-        logger.info(f"Strings saved to: {strings_path}")
-
-        return result
+        if do_fold or do_dis:
+            try:
+                text = data.decode("utf-8", "replace")
+            except Exception:
+                text = ""
+            if re.search(r"^\s*(import|def |class |x\s*=)", text,
+                         re.MULTILINE):
+                if do_fold:
+                    _, folds, _ = fold_constants(text)
+                    res.folds = [asdict(f) for f in folds[:40]]
+                if do_dis:
+                    res.disassembly = disassemble_python(text)
+        return res
 
 
-def print_report(result: AnalysisResult):
-    print("\n" + "=" * 60)
-    print("  M3 — Deobfuscation Tool — Report")
-    print("=" * 60)
-    print(f"  File:      {result.file_path}")
-    print(f"  Size:      {result.file_size} bytes")
-    print(f"  Type:      {result.file_type}")
-    print(f"  MD5:       {result.md5}")
-    print(f"  SHA256:    {result.sha256}")
-    print(f"  Entropy:   {result.total_entropy:.2f}")
-    print("-" * 60)
-    print(f"  Strings:         {len(result.extracted_strings)}")
-    print(f"  Decoded:         {len(result.decoded_payloads)}")
-    print(f"  Suspicious:      {len(result.suspicious_patterns)}")
-    print(f"  Recommendations: {len(result.recommendations)}")
-    print("-" * 60)
-
-    if result.extracted_strings:
-        print("  Top Strings:")
-        for s in result.extracted_strings[:15]:
-            print(f"    [{s['category']}] {s['value'][:80]}")
-
-    if result.decoded_payloads:
-        print("\n  Decoded Payloads:")
-        for dp in result.decoded_payloads[:10]:
-            print(f"    [{dp['method']}] confidence={dp['confidence']:.2f}")
-            print(f"      Output: {dp['output_preview'][:80]}")
-
-    if result.suspicious_patterns:
-        print("\n  Suspicious Patterns:")
-        for sp in result.suspicious_patterns:
-            print(f"    [!] {sp['pattern']}: {sp['count']} matches")
-
-    if result.recommendations:
-        print("\n  Recommendations:")
-        for rec in result.recommendations:
-            print(f"    -> {rec}")
-
-    print("=" * 60)
+def build_report(res, markdown=False):
+    if markdown:
+        lines = ["# M3 Deobfuscation Report", "",
+                 "**File:** `%s`  " % res.file_path,
+                 "**Type:** %s  " % res.file_type,
+                 "**Size:** %d bytes  " % res.file_size,
+                 "**SHA256:** `%s`  " % res.sha256,
+                 "**File entropy:** %.4f" % res.total_entropy,
+                 "", "## Constant folds", ""]
+        for f in res.folds:
+            lines.append("- `%s => %s` (line %d)" % (f["expression"],
+                                                     f["result"], f["line"]))
+        lines += ["", "## Decoded payloads", ""]
+        for p in res.decoded_payloads[:12]:
+            lines.append("- **%s** conf=%.2f" % (p["method"], p["confidence"]))
+            lines.append("  `%s`" % p["output_preview"][:80])
+        lines += ["", "## Disassembly (excerpt)", ""]
+        for ln in res.disassembly.splitlines()[:18]:
+            lines.append("    " + ln)
+        return "\n".join(lines)
+    return json.dumps(asdict(res), indent=2)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
-        description='M3 — Deobfuscation Tool'
-    )
-    parser.add_argument(
-        'input', help='Path to file to deobfuscate'
-    )
-    parser.add_argument(
-        '-o', '--output', help='Output directory for results'
-    )
-    parser.add_argument(
-        '--max-strings', type=int, default=5000,
-        help='Maximum strings to extract (default: 5000)'
-    )
-    parser.add_argument(
-        '--no-xor', dest='xor', action='store_false',
-        help='Disable XOR decoding'
-    )
-    parser.add_argument(
-        '--no-base64', dest='base64', action='store_false',
-        help='Disable Base64 decoding'
-    )
-    parser.add_argument(
-        '--no-hex', dest='hex', action='store_false',
-        help='Disable hex decoding'
-    )
-    parser.add_argument(
-        '-v', '--verbose', action='store_true',
-        help='Enable verbose output'
-    )
-    args = parser.parse_args()
+        prog="deobfuscator.py",
+        description="M3 - Deobfuscator (XOR/base64/hex lifting, constant "
+                    "folding, dis disassembly)")
+    parser.add_argument("input", help="Path to file to deobfuscate")
+    parser.add_argument("-o", "--output", default=None,
+                        help="Write JSON report here (default reports/…)")
+    parser.add_argument("--markdown", action="store_true",
+                        help="Also emit a Markdown report")
+    parser.add_argument("--max-strings", type=int, default=2000)
+    parser.add_argument("--no-xor", action="store_true")
+    parser.add_argument("--no-base64", action="store_true")
+    parser.add_argument("--no-hex", action="store_true")
+    parser.add_argument("--no-fold", action="store_true")
+    parser.add_argument("--no-dis", action="store_true")
+    args = parser.parse_args(argv)
 
     if not os.path.exists(args.input):
-        print(f"Error: File not found: {args.input}")
-        sys.exit(1)
+        print("Error: file not found: %s" % args.input)
+        return 1
+    try:
+        deob = Deobfuscator(
+            args.input, do_xor=not args.no_xor, do_b64=not args.no_base64,
+            do_hex=not args.no_hex, do_fold=not args.no_fold,
+            do_dis=not args.no_dis, max_strings=args.max_strings)
+        res = deob.run()
+    except Exception as e:
+        print("Error: %s" % e)
+        return 1
 
-    deob = Deobfuscator(args)
-    result = deob.run()
-    print_report(result)
+    out = args.output or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "reports", "deobf_report.json")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as f:
+        f.write(build_report(res, markdown=False))
+    if args.markdown:
+        mdp = out + ".md"
+        with open(mdp, "w") as f:
+            f.write(build_report(res, markdown=True))
+        print("Markdown report: %s" % mdp)
+
+    print(build_report(res, markdown=True))
+    print("\nJSON report: %s" % out)
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    sys.exit(main())
